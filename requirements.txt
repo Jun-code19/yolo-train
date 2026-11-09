@@ -1,12 +1,13 @@
 ultralytics
-gradio
+gradio>=6,<7
 # torch==2.0.1+cu121  
 # torchvision==0.15.2
 # torchautocast==2.0.1+cu121
 opencv-python
 opencv-python-headless
-numpy
+numpy<2
 scikit-learn
+seaborn
 dill
 onnx==1.15.0
 protobuf==3.20.3

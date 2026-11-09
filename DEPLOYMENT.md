@@ -50,19 +50,23 @@ sudo docker run --rm --gpus all nvidia/cuda:11.7.1-base-ubuntu20.04 nvidia-smi
 ## 二、项目文件结构
 
 ```
-YOLOV11/
+yolo-train/
 ├── app.py                  # 主程序（Gradio WebUI）
-├── config.json             # 配置文件（账号、主题、超时等）
+├── config.example.json     # 配置模板（首次部署复制为 config.json）
+├── config.json             # 配置文件（账号、主题、超时等，不入库）
 ├── docker-compose.yml      # Docker Compose 编排文件
 ├── Dockerfile.cpu          # CPU 版构建文件
 ├── Dockerfile.gpu          # GPU 版构建文件
 ├── .dockerignore           # Docker 构建忽略清单
 ├── requirements.txt        # Python 依赖清单
+├── convert.py              # ONNX → RKNN 转换脚本
+├── pt_to_onnx.py           # .pt → ONNX 导出脚本
+├── DEPLOYMENT.md           # 部署文档
 ├── assets/                 # 网页图标等静态资源
-├── ultralytics/            # Ultralytics 源码（含本地修改）
-├── models/                 # 模型文件目录（.pt）
-├── my_dataset/             # 数据集目录
-├── runs/                   # 训练结果输出目录
+├── ultralytics/            # Ultralytics 源码（含本地修改，不入库）
+├── models/                 # 模型文件目录（.pt，不入库）
+├── my_dataset/             # 数据集目录（不入库）
+├── runs/                   # 训练结果输出目录（不入库）
 └── wheels_gpu/             # GPU 版 PyTorch 本地 wheel（可选，加速构建）
     ├── torch-2.0.1+cu117-cp310-cp310-linux_x86_64.whl
     └── torchvision-0.15.2+cu117-cp310-cp310-linux_x86_64.whl
@@ -104,12 +108,15 @@ YOLOV11/
 
 ```bash
 # 1. 进入项目目录
-cd /path/to/YOLOV11
+cd /path/to/yolo-train
 
-# 2. 构建并启动（首次会下载基础镜像，约 5-10 分钟）
+# 2. 首次部署：复制配置模板并修改账号密码
+cp config.example.json config.json
+
+# 3. 构建并启动（首次会下载基础镜像，约 5-10 分钟）
 docker compose --profile cpu up -d --build
 
-# 3. 查看启动日志
+# 4. 查看启动日志
 docker compose --profile cpu logs -f
 ```
 
@@ -212,7 +219,7 @@ docker compose --profile gpu logs -f | grep -E "epoch|train|val"
 
 ```bash
 # 1. 上传新代码到服务器（覆盖原文件）
-scp app.py ubuntu@<服务器IP>:/path/to/YOLOV11/app.py
+scp app.py ubuntu@<服务器IP>:/path/to/yolo-train/app.py
 
 # 2. 重启容器即可生效
 docker compose --profile gpu restart
@@ -257,6 +264,10 @@ docker exec yolov11-gpu pip install <包名> -i https://mirrors.aliyun.com/pypi/
 | `/app/runs` | `./runs` | 训练结果（曲线图、权重等） |
 
 > **备份**：定期备份 `models/`、`my_dataset/`、`runs/` 三个目录即可保留所有训练成果。
+
+> **注意（克隆仓库后首次部署）**：仓库不包含 `config.json` 与 `ultralytics/` 目录。
+> 1. `config.json`：先执行 `cp config.example.json config.json`，否则 Docker 会把该挂载点创建成目录。
+> 2. `ultralytics/`：容器内已通过 `requirements.txt` 安装该包。如果不打算修改其源码，建议从 `docker-compose.yml` 中删除 `./ultralytics:/app/ultralytics` 这一行；若保留且本地目录为空，空目录会被挂载进容器并遮蔽已安装的包，导致 `import ultralytics` 失败。
 
 ---
 
@@ -448,7 +459,7 @@ docker run --rm --gpus all nvidia/cuda:11.7.1-base-ubuntu20.04 nvidia-smi
 
 # ============ 2. 上传项目代码 ============
 # 在本地 Windows 执行（用 scp 上传整个目录）
-scp -r YOLOV11 ubuntu@<服务器IP>:/home/ubuntu/yolo-train
+scp -r yolo-train ubuntu@<服务器IP>:/home/ubuntu/yolo-train
 
 # ============ 3. 准备 PyTorch wheel ============
 cd /home/ubuntu/yolo-train
@@ -459,7 +470,8 @@ wget https://mirrors.aliyun.com/pytorch-wheels/cu117/torchvision-0.15.2%2Bcu117-
 cd ..
 
 # ============ 4. 修改配置 ============
-# 修改默认密码
+# 从模板创建配置并修改默认密码
+cp config.example.json config.json
 nano config.json
 # 将 "password" 改为强密码
 

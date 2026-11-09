@@ -27,3 +27,7 @@ config.json
 .idea/
 .DS_Store
 Thumbs.db
+
+# ===== 本地预下载的 wheel（体积大，不入库；目录用 .gitkeep 占位）=====
+wheels/*.whl
+wheels_gpu/*.whl

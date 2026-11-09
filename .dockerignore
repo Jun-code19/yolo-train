@@ -14,3 +14,13 @@ docker-compose.yml
 测试CUDA是否可用.bat
 FFmpeg/
 py311/
+
+# 大体积数据与训练产物（运行时通过 volume 挂载，无需打进镜像）
+models/
+my_dataset/
+runs/
+
+# Python 虚拟环境与日志
+.venv/
+venv/
+*.log
