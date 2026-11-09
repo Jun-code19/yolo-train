@@ -13,6 +13,7 @@ ultralytics/
 models/
 runs/
 my_dataset/
+assets/
 
 # ===== 本地配置（含明文账号密码）=====
 config.json
