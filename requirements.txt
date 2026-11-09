@@ -1,0 +1,22 @@
+ultralytics
+gradio
+# torch==2.0.1+cu121  
+# torchvision==0.15.2
+# torchautocast==2.0.1+cu121
+opencv-python
+opencv-python-headless
+numpy
+scikit-learn
+dill
+onnx==1.15.0
+protobuf==3.20.3
+onnxruntime
+onnxslim
+# onnxruntime-gpu
+# RKNN 转换（ONNX → RKNN，目标平台 rk3588）
+rknn-toolkit2==2.3.2
+scipy
+coloredlogs
+flatbuffers
+ruamel.yaml
+fast-histogram

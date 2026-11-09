@@ -1,0 +1,75 @@
+# YOLO11 视觉智能平台 - GPU 版 Dockerfile (多阶段构建)
+# 使用 Python 3.10 官方镜像 + torch 2.0.1+cu117（wheel 自带 CUDA 11.7 运行库）
+# NVIDIA Container Toolkit 会通过 --gpus all 自动注入宿主机 GPU 驱动
+FROM python:3.10-slim-bookworm AS builder
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_BREAK_SYSTEM_PACKAGES=1
+
+# 替换为阿里云 Debian 镜像源（容错处理，失败不影响构建）
+RUN sed -i 's|deb.debian.org|mirrors.aliyun.com|g' /etc/apt/sources.list.d/debian.sources 2>/dev/null || \
+    sed -i 's|deb.debian.org|mirrors.aliyun.com|g' /etc/apt/sources.list 2>/dev/null || true && \
+    sed -i 's|security.debian.org|mirrors.aliyun.com|g' /etc/apt/sources.list.d/debian.sources 2>/dev/null || \
+    sed -i 's|security.debian.org|mirrors.aliyun.com|g' /etc/apt/sources.list 2>/dev/null || true
+
+# 安装编译依赖（仅构建阶段）
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends gcc g++ && \
+    rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# 安装 PyTorch + 项目依赖
+# 优先使用本地 wheel（wheels_gpu/ 目录，需为 cp310 + cu117 版本）
+# torch 2.0.1+cu117 的 wheel 自带完整 CUDA 11.7 运行库，无需在线下载 nvidia-* 依赖
+COPY wheels_gpu/ /tmp/wheels_gpu/
+RUN if ls /tmp/wheels_gpu/*.whl 1>/dev/null 2>&1; then \
+        echo "检测到本地 wheel 文件，开始离线安装..." && \
+        pip install --no-deps /tmp/wheels_gpu/*.whl && \
+        pip install typing-extensions networkx sympy filelock jinja2 fsspec markupsafe \
+            -i https://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com && \
+        rm -rf /tmp/wheels_gpu; \
+    else \
+        echo "本地 wheel 不存在，尝试通过 PyTorch 官方源在线安装 cu117 版本..." && \
+        pip install torch==2.0.1+cu117 torchvision==0.15.2+cu117 \
+            --index-url https://download.pytorch.org/whl/cu117; \
+    fi && \
+    pip install "numpy<2" ultralytics gradio opencv-python-headless scikit-learn seaborn "onnx==1.15.0" "protobuf==3.20.3" onnxslim onnxruntime dill \
+        -i https://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com && \
+    pip install rknn-toolkit2==2.3.2 --no-deps \
+        -i https://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com && \
+    pip install scipy coloredlogs flatbuffers ruamel.yaml fast-histogram \
+        -i https://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com
+
+# ==================== 运行阶段 ====================
+FROM python:3.10-slim-bookworm
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_BREAK_SYSTEM_PACKAGES=1
+
+# 替换为阿里云 Debian 镜像源
+RUN sed -i 's|deb.debian.org|mirrors.aliyun.com|g' /etc/apt/sources.list.d/debian.sources 2>/dev/null || \
+    sed -i 's|deb.debian.org|mirrors.aliyun.com|g' /etc/apt/sources.list 2>/dev/null || true && \
+    sed -i 's|security.debian.org|mirrors.aliyun.com|g' /etc/apt/sources.list.d/debian.sources 2>/dev/null || \
+    sed -i 's|security.debian.org|mirrors.aliyun.com|g' /etc/apt/sources.list 2>/dev/null || true
+
+# 仅安装运行时系统依赖（不含 gcc/g++，镜像更小）
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+    libgl1 libglib2.0-0 libsm6 libxcb1 ffmpeg && \
+    rm -rf /var/lib/apt/lists/*
+
+# 从构建阶段复制 Python 包
+COPY --from=builder /usr/local/lib/python3.10/site-packages /usr/local/lib/python3.10/site-packages
+COPY --from=builder /usr/local/bin /usr/local/bin
+
+WORKDIR /app
+COPY . .
+
+EXPOSE 7860
+
+CMD ["python", "app.py"]

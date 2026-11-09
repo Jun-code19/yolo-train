@@ -1,0 +1,64 @@
+# YOLO11 视觉智能平台 - Docker Compose 配置
+#
+# 使用方式：
+#   CPU 版本:  docker compose --profile cpu up -d --build
+#   GPU 版本:  docker compose --profile gpu up -d --build
+#
+# 查看日志:  docker compose logs -f
+# 停止服务:  docker compose down
+
+services:
+  # ==================== CPU 版本 ====================
+  cpu:
+    profiles: ["cpu"]
+    build:
+      context: .
+      dockerfile: Dockerfile.cpu
+    image: yolov11-webui:cpu
+    container_name: yolov11-cpu
+    ports:
+      - "7860:7860"
+    volumes:
+      - ./app.py:/app/app.py
+      - ./config.json:/app/config.json
+      - ./assets:/app/assets
+      - ./ultralytics:/app/ultralytics
+      - ./models:/app/models
+      - ./my_dataset:/app/my_dataset
+      - ./runs:/app/runs
+      - ./convert.py:/app/convert.py
+      - ./pt_to_onnx.py:/app/pt_to_onnx.py
+    shm_size: '8g'
+    restart: unless-stopped
+
+  # ==================== GPU 版本 ====================
+  gpu:
+    profiles: ["gpu"]
+    build:
+      context: .
+      dockerfile: Dockerfile.gpu
+    image: yolov11-webui:gpu
+    container_name: yolov11-gpu
+    ports:
+      - "7860:7860"
+    volumes:
+      - ./app.py:/app/app.py
+      - ./config.json:/app/config.json
+      - ./assets:/app/assets
+      - ./ultralytics:/app/ultralytics
+      - ./models:/app/models
+      - ./my_dataset:/app/my_dataset
+      - ./runs:/app/runs
+      - ./convert.py:/app/convert.py
+      - ./pt_to_onnx.py:/app/pt_to_onnx.py
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+    shm_size: '8g'
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    restart: unless-stopped

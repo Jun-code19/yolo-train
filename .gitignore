@@ -1,0 +1,29 @@
+# ===== Python 缓存与虚拟环境 =====
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# ===== 第三方包源码副本（依赖由 requirements.txt 声明）=====
+ultralytics/
+
+# ===== 体积过大的模型权重、训练产物与数据集 =====
+models/
+runs/
+my_dataset/
+
+# ===== 本地配置（含明文账号密码）=====
+config.json
+
+# ===== 日志与缓存 =====
+*.log
+.cache/
+.pytest_cache/
+
+# ===== IDE 与系统文件 =====
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

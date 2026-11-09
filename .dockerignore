@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+*.pyo
+.git
+.github
+.vscode
+.idea
+Thumbs.db
+Dockerfile.*
+docker-compose.yml
+启动.bat
+启动应用.bat
+安装依赖.bat
+测试CUDA是否可用.bat
+FFmpeg/
+py311/
