@@ -1,0 +1,28 @@
+# RF-DETR 训练/推理依赖（可选，仅在需要 RF-DETR 时安装）
+#
+# 版本约束（来自 rfdetr 1.12.0 的 METADATA）：
+#   Python >= 3.10
+#   torch >= 2.2.0
+#   torchvision >= 0.17.0
+#   transformers >= 5.1.0, < 6
+#   pydantic >= 2, < 3
+#   supervision >= 0.29.0
+#
+# 已知冲突与处理：
+# 1. rfdetr 1.12 要求 transformers>=5.1，而 transformers 5.x 要求 torch>=2.6，
+#    所以 torch 必须 >=2.6（cu118 最高只能到 2.6.0，2.7 起官方不再提供 cu118 wheel）。
+#    Dockerfile.gpu 默认已是 2.6.0+cu118，直接构建即可：
+#      docker build -f Dockerfile.gpu -t yolov11-webui:gpu-rfdetr \
+#        --build-arg INSTALL_RFDETR=true .
+# 2. 本项目固定 onnx==1.15.0 / protobuf==3.20.3。
+#    rfdetr 的 [onnx] 额外依赖要求 onnx>=1.16.0，两者冲突，
+#    因此这里只安装 [train,loggers]，不要安装 [onnx]。
+#    RF-DETR 导出 ONNX 时需另行评估 onnx 版本。
+# 3. 采用 --no-deps 安装 rknn-toolkit2 时不会触碰上述包，互不影响。
+#    rknn-toolkit2 元数据声明 torch<=2.4，但本项目只用它的 ONNX->RKNN 转换，
+#    运行时不加载 torch，实测与 torch 2.6 共存无影响。
+#
+# 安装命令：
+#   pip install -r requirements-rfdetr.txt
+# 首次训练会自动下载对应变体的预训练权重（rf-detr-nano/small/medium/large.pth）。
+rfdetr[train,loggers]>=1.12.0,<2

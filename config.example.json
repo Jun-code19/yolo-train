@@ -1,7 +1,7 @@
 {
     "username": "admin",
     "password": "admin123",
-    "app_title": "YOLO 视觉训练平台",
+    "app_title": "YOLO + RF-DETR 视觉训练平台",
     "favicon_path": "assets/fangte_dark.ico",
     "default_theme": "light",
     "session_timeout_minutes": 720

@@ -22,6 +22,7 @@ import dill
 
 import gradio as gr
 from ultralytics import YOLO
+import rfdetr_support
 import os
 import cv2
 import numpy as np
@@ -42,6 +43,19 @@ import time
 import datetime
 
 logging.basicConfig(level=logging.INFO)
+
+# 关闭 ultralytics 的第三方日志集成（wandb / clearml / mlflow / comet 等）。
+# 这些包由 rfdetr[loggers] 一并安装，ultralytics 检测到就会在训练开始时自动初始化，
+# 没配置账号时直接报 "No API key configured. Use `wandb login` to log in." 导致训练失败。
+# 集成回调是在 Trainer 初始化时才导入的，这里提前改 settings 即可生效（会写入持久化配置文件）。
+try:
+    from ultralytics import settings as _ul_settings
+    _ul_settings.update(
+        wandb=False, clearml=False, mlflow=False, comet=False,
+        dvc=False, neptune=False, raytune=False, tensorboard=False,
+    )
+except Exception as _e:
+    logging.getLogger(__name__).warning("关闭 ultralytics 第三方日志集成失败: %s", _e)
 
 # 训练状态管理
 _training_stop_flag = threading.Event()
@@ -180,6 +194,9 @@ def get_available_models(task):
     online_models = set(ONLINE_MODELS.get(task, []))
     
     all_models = local_models.union(online_models)
+    # RF-DETR 仅支持检测任务，追加其权重供训练/预测下拉框选择
+    if task == "检测":
+        all_models = all_models.union(rfdetr_support.list_models())
     return sorted(list(all_models))
 
 def get_model(task, model_name, device):
@@ -591,6 +608,19 @@ def translate_label(label):
     return translations.get(label.lower(), label)  # 如果没有翻译,返回原标签
 
 def predict_image(image, task, model_name, device, conf, iou, max_det, classes, agnostic_nms, augment):
+    # RF-DETR 权重以 .pth 结尾，走独立推理分支（仅支持检测）
+    if str(model_name).endswith('.pth'):
+        weight_path = rfdetr_support.find_model(model_name)
+        if not weight_path:
+            return None, {"error": f"未找到 RF-DETR 权重: {model_name}"}
+        if task != "检测":
+            return None, {"error": "RF-DETR 仅支持检测任务，请将任务类型切换为「检测」。"}
+        image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB) if image.shape[-1] == 3 else image
+        try:
+            return rfdetr_support.predict(weight_path, image_rgb, conf=conf, translate=translate_label)
+        except Exception as e:
+            return None, {"error": f"RF-DETR 预测失败: {e}"}
+
     model = get_model(task, model_name, device)
     
     # 确保输入图像是RGB格式
@@ -1122,6 +1152,15 @@ def list_all_models():
                         result.append((label, f, size_mb))
             except Exception:
                 continue
+
+    # RF-DETR 权重（.pth）统一归入检测类展示
+    for f in rfdetr_support.list_models():
+        full = os.path.join(rfdetr_support.RF_MODEL_DIR, f)
+        try:
+            size_mb = round(os.path.getsize(full) / (1024 * 1024), 2)
+            result.append(("检测(RF-DETR)", f, size_mb))
+        except Exception:
+            continue
     return result
 
 
@@ -1707,6 +1746,90 @@ def train_model_with_log(data_path, epochs, task, model_name, device, include_te
         yield "\n".join(_training_all_logs[-200:]) + "\n\n" + _training_result
 
 
+def rfdetr_train_with_log(data_path, epochs, task, batch_size, device, variant, resolution, lr, grad_accum,
+                          include_test=True, test_size=0.2, val_size=0.2):
+    """启动 RF-DETR 训练线程，实时 yield 训练日志（暂不支持预约）。"""
+    global _training_active, _training_all_logs, _training_result
+
+    if not rfdetr_support.is_available():
+        yield ("❌ 未安装 rfdetr，无法启动 RF-DETR 训练。\n"
+               "请在容器/环境中执行：pip install -r requirements-rfdetr.txt\n"
+               "或用构建参数重建镜像：docker compose --profile gpu build --build-arg INSTALL_RFDETR=true\n"
+               "注意：RF-DETR 要求 torch>=2.6（GPU 镜像默认已是 2.6.0+cu118）。")
+        return
+    if task != "检测":
+        yield "❌ RF-DETR 仅支持检测任务，请将「任务类型」切换为「检测」。"
+        return
+
+    with _training_lock:
+        if _training_active:
+            yield "⚠️ 已有训练正在运行，请先停止当前训练。"
+            return
+        _training_active = True
+
+    tid = _add_task("running", "RF-DETR", variant, data_path, epochs)
+    _training_stop_flag.clear()
+    _training_all_logs = []
+    _training_result = None
+    while not _training_log_queue.empty():
+        _training_log_queue.get()
+
+    device_arg = "cuda" if (device == "cuda" and torch.cuda.is_available()) else "cpu"
+
+    def _worker():
+        global _training_result, _training_active
+        try:
+            _training_log_queue.put("⏳ [1/3] 检查数据集...")
+            if not check_dataset(data_path):
+                raise RuntimeError("数据集检查失败，请查看日志")
+            split_dataset(data_path, test_size=float(test_size), val_size=float(val_size))
+            create_dataset_yaml(data_path, include_test=include_test)
+            _training_log_queue.put("⏳ [2/3] 加载 RF-DETR 模型...")
+            _training_log_queue.put("⏳ [3/3] 开始训练... 可点击「⏹️ 停止训练」中断。")
+            msg = rfdetr_support.train(
+                data_path, variant, epochs, batch_size, lr, resolution, grad_accum,
+                device_arg, _training_log_queue.put, _training_stop_flag
+            )
+            _training_result = msg
+            if "❌" in msg:
+                status = "failed"
+            elif _training_stop_flag.is_set():
+                status = "stopped"
+            else:
+                status = "completed"
+            _update_task(tid, status=status, end_at=time.time(), result_msg=msg)
+        except Exception as e:
+            msg = f"❌ RF-DETR 训练出错: {e}"
+            _training_result = msg
+            _update_task(tid, status="failed", end_at=time.time(), result_msg=msg)
+        finally:
+            with _training_lock:
+                _training_active = False
+
+    threading.Thread(target=_worker, daemon=True).start()
+
+    while True:
+        with _training_lock:
+            still_active = _training_active
+        if not still_active and _training_log_queue.empty():
+            break
+        try:
+            line = _training_log_queue.get(timeout=1.0)
+            _training_all_logs.append(line)
+            if line.startswith("Epoch "):
+                try:
+                    cur = int(line.split("Epoch ")[1].split("/")[0])
+                    _update_task(tid, current_epoch=cur)
+                except Exception:
+                    pass
+        except queue_module.Empty:
+            pass
+        yield "\n".join(_training_all_logs[-200:])
+
+    if _training_result:
+        yield "\n".join(_training_all_logs[-200:]) + "\n\n" + _training_result
+
+
 def cancel_scheduled_task(task_id_str):
     """取消预约任务。task_id_str 为字符串的 #id。"""
     if not task_id_str:
@@ -1872,6 +1995,8 @@ def predict_batch(images, task, model_name, device, conf, iou, max_det, classes,
     """批量预测多张图片，返回 (gallery_results, json_results)。"""
     gallery_results = []
     json_results = []
+    if str(model_name).endswith('.pth'):
+        return [], {"错误": "批量预测暂不支持 RF-DETR，请使用单张图片预测。"}
     if not images:
         return [], {"信息": "未提供图像。"}
 
@@ -2317,7 +2442,7 @@ def load_config():
     default_config = {
         "username": "admin",
         "password": "admin123",
-        "app_title": "YOLO 视觉训练平台",
+        "app_title": "YOLO + RF-DETR 视觉训练平台",
         "favicon_path": "",
         "default_theme": "light",
         "session_timeout_minutes": 720
@@ -2426,8 +2551,8 @@ with gr.Blocks(title=APP_CONFIG["app_title"]) as demo:
                 elem_classes="login-header"
             )
             gr.Markdown(
-                "基于 Ultralytics YOLO11 的视觉智能训练平台  \n"
-                "支持模型训练、图片预测、视频推理、模型导出、ONNX→RKNN 转换与数据集管理",
+                "基于 Ultralytics YOLO11 + RF-DETR 的视觉智能训练平台  \n"
+                "支持双框架模型训练、图片预测、视频推理、模型导出、ONNX→RKNN 转换与数据集管理",
                 elem_classes="login-desc"
             )
             gr.HTML("<hr style='border:none;border-top:1px solid var(--border-color-primary);margin:16px 0;'/>")
@@ -2444,7 +2569,7 @@ with gr.Blocks(title=APP_CONFIG["app_title"]) as demo:
         # ---------- 顶部标题与主题切换 ----------
         gr.Markdown(
             f"# {APP_CONFIG['app_title']}\n"
-            "基于 Ultralytics YOLO 的视觉训练平台，支持模型训练、图片预测、视频推理、模型导出与 ONNX→RKNN 转换。",
+            "基于 Ultralytics YOLO11 + RF-DETR 的视觉训练平台，支持双框架模型训练、图片预测、视频推理、模型导出与 ONNX→RKNN 转换。",
             elem_classes="main-header"
         )
         with gr.Row(elem_classes="header-row"):
@@ -2544,81 +2669,108 @@ with gr.Blocks(title=APP_CONFIG["app_title"]) as demo:
 
         # ==================== 训练 ====================
         with gr.Tab("🎯 训练"):
-            gr.Markdown("配置训练任务与数据集，点击「开始训练」后将实时输出训练日志。", elem_classes="tab-tip")
+            gr.Markdown("选择训练框架并配置参数，点击「开始训练」后将实时输出训练日志。", elem_classes="tab-tip")
+
+            # 训练框架选择（顶部总开关，控制下方专属参数区显隐）
+            train_framework = gr.Radio(
+                ["YOLO (Ultralytics)", "RF-DETR"], label="训练框架", value="YOLO (Ultralytics)",
+                info="YOLO 支持检测/分割/姿态/分类/OBB 与预约训练；RF-DETR 仅支持检测、立即训练"
+            )
+
+            # ---- 通用参数（两个框架共用）----
             with gr.Row():
-                with gr.Column(scale=1):
+                _init_ds_choices, _init_ds_value = get_dataset_choices()
+                data_input = gr.Dropdown(label="选择数据集", info="数据集位于 my_dataset/ 目录下",
+                                        value=_init_ds_value, choices=_init_ds_choices)
+                epochs_input = gr.Number(label="训练轮数 (epochs)", value=100)
+                batch_size_input = gr.Number(label="批量大小 (batch)", value=16)
+
+            # ---- YOLO 专属参数区（选择 RF-DETR 时整组隐藏）----
+            with gr.Column(visible=True) as yolo_param_group:
+                with gr.Row():
                     train_task_input = gr.Dropdown(["检测", "分割", "姿态", "分类", "OBB"], label="任务类型", value="检测")
                     train_model_input = gr.Dropdown([], label="选择模型", info="切换任务类型后自动刷新可选模型")
-                    _init_ds_choices, _init_ds_value = get_dataset_choices()
-                    data_input = gr.Dropdown(label="选择数据集", info="数据集位于 my_dataset/ 目录下",
-                                            value=_init_ds_value, choices=_init_ds_choices)
-                with gr.Column(scale=1):
-                    epochs_input = gr.Number(label="训练轮数 (epochs)", value=100)
-                    batch_size_input = gr.Number(label="批量大小 (batch)", value=16)
                     imgsz_input = gr.Number(label="图像尺寸 (imgsz)", value=640)
 
+                with gr.Accordion("优化器与学习率", open=False):
+                    with gr.Row():
+                        patience_input = gr.Number(label="早停耐心值 (patience)", value=50)
+                        optimizer_input = gr.Dropdown(["SGD", "Adam", "AdamW", "RMSProp"], label="优化器", value="SGD")
+                    with gr.Row():
+                        lr0_input = gr.Number(label="初始学习率 (lr0)", value=0.01)
+                        lrf_input = gr.Number(label="最终学习率因子 (lrf)", value=0.01)
+                    with gr.Row():
+                        momentum_input = gr.Number(label="动量 (momentum)", value=0.937)
+                        weight_decay_input = gr.Number(label="权重衰减 (weight_decay)", value=0.0005)
+                    with gr.Row():
+                        warmup_epochs_input = gr.Number(label="预热轮数 (warmup_epochs)", value=3.0)
+                        warmup_momentum_input = gr.Number(label="预热动量 (warmup_momentum)", value=0.8)
+                        warmup_bias_lr_input = gr.Number(label="预热偏置学习率 (warmup_bias_lr)", value=0.1)
+
+                with gr.Accordion("损失权重", open=False):
+                    with gr.Row():
+                        box_input = gr.Number(label="框损失增益 (box)", value=7.5)
+                        cls_input = gr.Number(label="类别损失增益 (cls)", value=0.5)
+                        dfl_input = gr.Number(label="DFL损失增益 (dfl)", value=1.5)
+                    with gr.Row():
+                        pose_input = gr.Number(label="姿态损失增益 (pose)", value=12.0)
+                        kobj_input = gr.Number(label="关键点目标损失增益 (kobj)", value=2.0)
+                        label_smoothing_input = gr.Number(label="标签平滑 (label_smoothing)", value=0.0)
+
+                with gr.Accordion("训练策略与数据增强", open=False):
+                    with gr.Row():
+                        nbs_input = gr.Number(label="标称批量大小 (nbs)", value=64)
+                        mask_ratio_input = gr.Number(label="遮罩比例 (mask_ratio)", value=4)
+                        dropout_input = gr.Number(label="Dropout率", value=0.0)
+                    with gr.Row():
+                        overlap_mask_input = gr.Checkbox(label="重叠遮罩 (overlap_mask)", value=True)
+                        augment_input = gr.Checkbox(label="使用数据增强 (augment)", value=True)
+                        amp_input = gr.Checkbox(label="自动混合精度 (AMP)", value=True)
+                    with gr.Row():
+                        mixup_input = gr.Slider(minimum=0, maximum=1, value=0.1, step=0.05, label="Mixup 强度")
+                        copy_paste_input = gr.Slider(minimum=0, maximum=1, value=0.1, step=0.05, label="Copy-Paste 强度")
+                        mosaic_input = gr.Slider(minimum=0, maximum=1, value=1.0, step=0.05, label="Mosaic 强度")
+
+                with gr.Accordion("⏰ 训练调度（立即/预约）", open=True):
+                    train_mode = gr.Radio(["🚀 立即训练", "📅 预约训练"], label="启动方式", value="🚀 立即训练", interactive=True)
+                    now_default = (datetime.datetime.now() + datetime.timedelta(minutes=5)).replace(second=0, microsecond=0)
+                    schedule_date = gr.DateTime(
+                        label="预约开始时间",
+                        value=now_default,
+                        type="datetime",
+                        interactive=True
+                    )
+                    gr.Markdown("预约时间必须晚于当前时间。到点后若有其他训练在运行，会等待其结束后再自动启动。", elem_classes="tab-tip")
+
+                with gr.Accordion("📅 取消预约任务", open=False):
+                    with gr.Row():
+                        cancel_scheduled_dd = gr.Dropdown([], label="选择预约任务", scale=3, allow_custom_value=True)
+                        cancel_scheduled_refresh = gr.Button("🔄 刷新列表", size="sm", variant="secondary")
+                        cancel_scheduled_btn = gr.Button("❌ 取消预约", variant="stop", size="sm")
+                    cancel_scheduled_result = gr.Textbox(label="取消结果", lines=2)
+
+            # ---- RF-DETR 专属参数区（选择 YOLO 时隐藏）----
+            with gr.Group(visible=False) as rf_param_group:
+                with gr.Row():
+                    rf_variant = gr.Dropdown(
+                        list(rfdetr_support.RF_VARIANTS.keys()), label="RF-DETR 变体",
+                        value="RF-DETR Small", info="切换变体自动填充推荐分辨率 / batch / 梯度累积"
+                    )
+                    rf_resolution = gr.Number(label="分辨率 (resolution)", value=512, precision=0, info="必须为 32 的倍数")
+                with gr.Row():
+                    rf_lr = gr.Number(label="学习率 (lr)", value=0.0001)
+                    rf_grad_accum = gr.Number(label="梯度累积步数", value=4, precision=0, info="有效 batch = batch × 梯度累积")
+                gr.Markdown(
+                    "RTX 3060 12GB 参考：Nano 384px(b8/g2) · Small 512px(b4/g4) · Medium 576px(b2/g8)；Large 需更大显存。首次训练自动下载 COCO 预训练权重。",
+                    elem_classes="tab-tip"
+                )
+
+            # ---- 通用：数据集分割 ----
             with gr.Accordion("数据集分割设置", open=False):
                 with gr.Row():
                     include_test = gr.Checkbox(label="包含测试集", value=True)
                     test_size = gr.Slider(minimum=0.1, maximum=0.5, value=0.2, step=0.05, label="测试集比例")
                     val_size = gr.Slider(minimum=0.1, maximum=0.5, value=0.2, step=0.05, label="验证集比例")
-
-            with gr.Accordion("优化器与学习率", open=False):
-                with gr.Row():
-                    patience_input = gr.Number(label="早停耐心值 (patience)", value=50)
-                    optimizer_input = gr.Dropdown(["SGD", "Adam", "AdamW", "RMSProp"], label="优化器", value="SGD")
-                with gr.Row():
-                    lr0_input = gr.Number(label="初始学习率 (lr0)", value=0.01)
-                    lrf_input = gr.Number(label="最终学习率因子 (lrf)", value=0.01)
-                with gr.Row():
-                    momentum_input = gr.Number(label="动量 (momentum)", value=0.937)
-                    weight_decay_input = gr.Number(label="权重衰减 (weight_decay)", value=0.0005)
-                with gr.Row():
-                    warmup_epochs_input = gr.Number(label="预热轮数 (warmup_epochs)", value=3.0)
-                    warmup_momentum_input = gr.Number(label="预热动量 (warmup_momentum)", value=0.8)
-                    warmup_bias_lr_input = gr.Number(label="预热偏置学习率 (warmup_bias_lr)", value=0.1)
-
-            with gr.Accordion("损失权重", open=False):
-                with gr.Row():
-                    box_input = gr.Number(label="框损失增益 (box)", value=7.5)
-                    cls_input = gr.Number(label="类别损失增益 (cls)", value=0.5)
-                    dfl_input = gr.Number(label="DFL损失增益 (dfl)", value=1.5)
-                with gr.Row():
-                    pose_input = gr.Number(label="姿态损失增益 (pose)", value=12.0)
-                    kobj_input = gr.Number(label="关键点目标损失增益 (kobj)", value=2.0)
-                    label_smoothing_input = gr.Number(label="标签平滑 (label_smoothing)", value=0.0)
-
-            with gr.Accordion("训练策略与数据增强", open=False):
-                with gr.Row():
-                    nbs_input = gr.Number(label="标称批量大小 (nbs)", value=64)
-                    mask_ratio_input = gr.Number(label="遮罩比例 (mask_ratio)", value=4)
-                    dropout_input = gr.Number(label="Dropout率", value=0.0)
-                with gr.Row():
-                    overlap_mask_input = gr.Checkbox(label="重叠遮罩 (overlap_mask)", value=True)
-                    augment_input = gr.Checkbox(label="使用数据增强 (augment)", value=True)
-                    amp_input = gr.Checkbox(label="自动混合精度 (AMP)", value=True)
-                with gr.Row():
-                    mixup_input = gr.Slider(minimum=0, maximum=1, value=0.1, step=0.05, label="Mixup 强度")
-                    copy_paste_input = gr.Slider(minimum=0, maximum=1, value=0.1, step=0.05, label="Copy-Paste 强度")
-                    mosaic_input = gr.Slider(minimum=0, maximum=1, value=1.0, step=0.05, label="Mosaic 强度")
-
-            with gr.Accordion("⏰ 训练调度（立即/预约）", open=True):
-                train_mode = gr.Radio(["🚀 立即训练", "📅 预约训练"], label="启动方式", value="🚀 立即训练", interactive=True)
-                now_default = (datetime.datetime.now() + datetime.timedelta(minutes=5)).replace(second=0, microsecond=0)
-                schedule_date = gr.DateTime(
-                    label="预约开始时间",
-                    value=now_default,
-                    type="datetime",
-                    interactive=True
-                )
-                gr.Markdown("预约时间必须晚于当前时间。到点后若有其他训练在运行，会等待其结束后再自动启动。", elem_classes="tab-tip")
-
-            with gr.Accordion("📅 取消预约任务", open=False):
-                with gr.Row():
-                    cancel_scheduled_dd = gr.Dropdown([], label="选择预约任务", scale=3, allow_custom_value=True)
-                    cancel_scheduled_refresh = gr.Button("🔄 刷新列表", size="sm", variant="secondary")
-                    cancel_scheduled_btn = gr.Button("❌ 取消预约", variant="stop", size="sm")
-                cancel_scheduled_result = gr.Textbox(label="取消结果", lines=2)
 
             with gr.Row():
                 train_button = gr.Button("🚀 开始训练 / 创建预约", variant="primary")
@@ -2628,7 +2780,21 @@ with gr.Blocks(title=APP_CONFIG["app_title"]) as demo:
 
             train_task_input.change(update_model_choices, inputs=[train_task_input], outputs=[train_model_input])
 
-            def _start_training(mode, sched_date, *args):
+            def _start_training(mode, sched_date, framework, rf_variant, rf_resolution, rf_lr, rf_grad_accum,
+                                data_path, epochs, task, model_name, device, batch_size, *yolo_args):
+                # RF-DETR 分支：独立训练链路，暂不支持预约
+                if "RF-DETR" in str(framework):
+                    if "预约" in str(mode):
+                        yield "⚠️ RF-DETR 暂不支持预约训练，请选择「🚀 立即训练」。"
+                        return
+                    include_test, test_size_val, val_size_val = yolo_args[0], yolo_args[1], yolo_args[2]
+                    yield from rfdetr_train_with_log(
+                        data_path, epochs, task, batch_size, device,
+                        rf_variant, rf_resolution, rf_lr, rf_grad_accum,
+                        include_test=include_test, test_size=test_size_val, val_size=val_size_val
+                    )
+                    return
+
                 sched_ts = None
                 if "预约" in str(mode):
                     try:
@@ -2645,13 +2811,22 @@ with gr.Blocks(title=APP_CONFIG["app_title"]) as demo:
                     except Exception as e:
                         yield f"⚠️ 预约时间解析失败: {e}"
                         return
-                yield from train_model_with_log(*args, _schedule_ts=sched_ts)
+
+                include_test, test_size_val, val_size_val, imgsz = yolo_args[:4]
+                rest = yolo_args[4:]
+                yield from train_model_with_log(
+                    data_path, epochs, task, model_name, device,
+                    include_test, test_size_val, val_size_val, batch_size, imgsz, *rest,
+                    _schedule_ts=sched_ts
+                )
 
             train_click_event = train_button.click(
                 _start_training,
-                inputs=[train_mode, schedule_date,
+                inputs=[train_mode, schedule_date, train_framework,
+                        rf_variant, rf_resolution, rf_lr, rf_grad_accum,
                         data_input, epochs_input, train_task_input, train_model_input,
-                        device_input, include_test, test_size, val_size, batch_size_input, imgsz_input,
+                        device_input, batch_size_input,
+                        include_test, test_size, val_size, imgsz_input,
                         patience_input, optimizer_input, lr0_input, lrf_input, momentum_input,
                         weight_decay_input, warmup_epochs_input, warmup_momentum_input,
                         warmup_bias_lr_input, box_input, cls_input, dfl_input, pose_input,
@@ -2659,6 +2834,36 @@ with gr.Blocks(title=APP_CONFIG["app_title"]) as demo:
                         mask_ratio_input, dropout_input,
                         augment_input, mixup_input, copy_paste_input, mosaic_input, amp_input],
                 outputs=train_output
+            )
+
+            def _rf_recommend(variant):
+                """按变体返回推荐 (resolution, batch, grad_accum)。"""
+                info = rfdetr_support.RF_VARIANTS.get(variant) or rfdetr_support.RF_VARIANTS["RF-DETR Small"]
+                return info["resolution"], info["batch"], info["grad_accum"]
+
+            def _on_framework_change(framework, variant):
+                is_rf = "RF-DETR" in str(framework)
+                if is_rf:
+                    res, b, ga = _rf_recommend(variant)
+                    return (gr.update(visible=False), gr.update(visible=True),
+                            gr.update(value=b), gr.update(value=res), gr.update(value=ga))
+                return (gr.update(visible=True), gr.update(visible=False),
+                        gr.update(value=16), gr.update(), gr.update())
+
+            train_framework.change(
+                _on_framework_change,
+                inputs=[train_framework, rf_variant],
+                outputs=[yolo_param_group, rf_param_group, batch_size_input, rf_resolution, rf_grad_accum]
+            )
+
+            def _on_variant_change(variant):
+                res, b, ga = _rf_recommend(variant)
+                return gr.update(value=res), gr.update(value=b), gr.update(value=ga)
+
+            rf_variant.change(
+                _on_variant_change,
+                inputs=[rf_variant],
+                outputs=[rf_resolution, batch_size_input, rf_grad_accum]
             )
 
             def _stop_training():
@@ -3292,17 +3497,17 @@ with gr.Blocks(title=APP_CONFIG["app_title"]) as demo:
 
         # ==================== 帮助文档 ====================
         with gr.Tab("📖 帮助文档"):
-            gr.Markdown("## YOLO11 视觉训练平台 - 完整使用手册", elem_classes="main-header")
+            gr.Markdown("## YOLO + RF-DETR 视觉训练平台 - 完整使用手册", elem_classes="main-header")
 
             with gr.Accordion("🚀 快速入门", open=True):
                 gr.Markdown("""
     #### 5 步上手
 
     1. **导入数据集** → 进入「📁 数据集管理」，上传压缩包（推荐）或手动上传图片/标签/classes.txt
-    2. **选择模型** → 进入「🎯 训练」，选择任务类型和数据集，选择预训练模型（如 yolo11n.pt）
-    3. **开始训练** → 设置 epochs/batch 等参数，选择「立即训练」或「预约训练」，点击开始
+    2. **选择框架与模型** → 进入「🎯 训练」，训练框架选 `YOLO (Ultralytics)` 或 `RF-DETR`，再选任务类型、数据集和预训练模型
+    3. **开始训练** → 设置 epochs/batch 等参数，选择「立即训练」或「预约训练」（RF-DETR 仅支持立即训练），点击开始
     4. **查看结果** → 训练完成后，在「🏠 首页」的「📂 训练结果」中查看曲线图、混淆矩阵，可打包下载
-    5. **预测/导出/转换** → 进入「🔮 图片预测」测试图片，「🗂️ 模型管理」导出 ONNX（opset=12），「🔄 模型转换」生成 RKNN 部署到边缘盒子
+    5. **预测/导出/转换** → 进入「🔮 图片预测」测试图片（YOLO 选 .pt，RF-DETR 选 .pth），「🗂️ 模型管理」导出 ONNX（opset=12），「🔄 模型转换」生成 RKNN 部署到边缘盒子
 
     #### 目录结构
     ```
@@ -3312,7 +3517,8 @@ with gr.Blocks(title=APP_CONFIG["app_title"]) as demo:
     │   ├── segmentation/    # 分割任务模型
     │   ├── pose/            # 姿态任务模型
     │   ├── classification/  # 分类任务模型
-    │   └── obb/             # 旋转目标检测模型
+    │   ├── obb/             # 旋转目标检测模型
+    │   └── rfdetr/          # RF-DETR 权重 (.pth + .json 元数据)
     ├── my_dataset/          # 数据集根目录
     │   └── your_dataset/    # 每个数据集一个文件夹
     │       ├── images/      # 图片 (支持 train/val/test 子目录)
@@ -3321,6 +3527,7 @@ with gr.Blocks(title=APP_CONFIG["app_title"]) as demo:
     ├── runs/                # 训练完整输出目录 (曲线图、权重等)
     ├── assets/              # 网页图标
     ├── config.json          # 配置文件 (账号密码、主题等)
+    ├── rfdetr_support.py    # RF-DETR 训练/推理适配层
     ├── Dockerfile.cpu       # CPU 版 Docker 构建
     ├── Dockerfile.gpu       # GPU 版 Docker 构建
     └── docker-compose.yml   # Docker Compose 编排
@@ -3407,12 +3614,21 @@ with gr.Blocks(title=APP_CONFIG["app_title"]) as demo:
 
             with gr.Accordion("🎯 训练功能", open=False):
                 gr.Markdown("""
+    #### 训练框架：YOLO vs RF-DETR
+
+    | 框架 | 权重后缀 | 支持任务 | 预约训练 | 说明 |
+    |------|---------|----------|---------|------|
+    | YOLO (Ultralytics) | .pt | 检测/分割/姿态/分类/OBB | ✅ | 默认框架，功能最全 |
+    | RF-DETR | .pth | 仅检测 | ❌ | Roboflow 端到端检测模型，基于 Transformer |
+
+    切换框架后，页面会显示对应框架的专属参数。两个框架共用同一套数据集，无需额外转换。
+
     #### 立即训练 vs 预约训练
 
     | 模式 | 说明 |
     |------|------|
     | 🚀 立即训练 | 点击后立即开始训练，实时输出日志 |
-    | 📅 预约训练 | 设置未来某个时间点自动开始训练，到点后自动启动 |
+    | 📅 预约训练 | 设置未来某个时间点自动开始训练，到点后自动启动（仅 YOLO） |
 
     预约训练适合在空闲时段（如夜间）自动执行。预约后可在「📅 取消预约任务」中取消。
 
@@ -3420,11 +3636,28 @@ with gr.Blocks(title=APP_CONFIG["app_title"]) as demo:
     训练过程中可随时点击「⏹️ 停止训练」，训练会在当前 epoch 完成后停止。已完成的 epoch 权重会保存。
 
     #### 训练结果
-    - **模型自动复制**：训练完成后，`best.pt` 自动复制到 `models/` 目录（如 `yolo11n_trained.pt`），可直接在图片预测中使用
+    - **模型自动复制**：训练完成后，YOLO 的 `best.pt` 自动复制到 `models/` 目录；RF-DETR 的最佳权重（EMA）自动复制到 `models/rfdetr/`（.pth + .json 元数据）
     - **完整结果**：在「🏠 首页」→「📂 训练结果」中查看，包含训练曲线、混淆矩阵、验证批次图等
     - **打包下载**：点击「📦 打包下载全部」可将整个训练结果目录打包为 ZIP 下载
 
-    #### 基本参数
+    #### RF-DETR 专属参数
+    | 参数 | 默认值 | 说明 |
+    |------|--------|------|
+    | 变体 | RF-DETR Nano | Nano(384px)/Small(512px)/Medium(576px)/Large(704px)，参数量依次增大 |
+    | 分辨率 | 随变体 | 输入图像尺寸，必须为 32 的倍数 |
+    | 学习率 | 0.0001 | 初始学习率，Transformer 模型通常比 YOLO 小 |
+    | 梯度累积 | 2 | 有效 batch = batch × 梯度累积，显存不足时增大此值 |
+
+    **RTX 3060 12GB 推荐配置**：
+    | 变体 | 分辨率 | batch | 梯度累积 | 显存 |
+    |------|--------|-------|---------|------|
+    | Nano | 384 | 8 | 2 | ~5-6 GB |
+    | Small | 512 | 4 | 4 | ~8-10 GB |
+    | Medium | 576 | 2 | 8 | ~11-12 GB |
+
+    > 首次训练会自动下载对应变体的 COCO 预训练权重。RF-DETR 使用 bf16 混合精度训练。
+
+    #### YOLO 基本参数
     | 参数 | 默认值 | 说明 |
     |------|--------|------|
     | 任务类型 | 检测 | 选择检测/分割/姿态/分类/OBB |
@@ -3582,6 +3815,16 @@ with gr.Blocks(title=APP_CONFIG["app_title"]) as demo:
     > n=nano, s=small, m=medium, l=large, x=extra large
     >
     > 训练后的模型自动命名为 `{原模型名}_trained.pt`（如 `yolo11n_trained.pt`），重复训练自动追加序号 `_1`、`_2`
+
+    #### RF-DETR 模型规格
+    | 变体 | 默认分辨率 | 参数量 | 适用场景 |
+    |------|-----------|--------|----------|
+    | RF-DETR Nano | 384 | ~30M | 边缘设备、快速验证 |
+    | RF-DETR Small | 512 | ~50M | 平衡精度与速度 |
+    | RF-DETR Medium | 576 | ~80M | 高精度需求 |
+    | RF-DETR Large | 704 | ~130M | 服务器级 GPU（12GB 显存不够） |
+
+    > RF-DETR 训练产物保存在 `models/rfdetr/`，包含 `.pth` 权重和同名 `.json` 元数据（类别名、变体、分辨率等），预测时自动读取。
     """)
 
             with gr.Accordion("❓ 常见问题", open=False):
@@ -3618,6 +3861,18 @@ with gr.Blocks(title=APP_CONFIG["app_title"]) as demo:
 
     #### Q: 忘记登录密码？
     A: 查看 `config.json` 文件中的 `password` 字段。
+
+    #### Q: RF-DETR 训练报 "Failed to find C compiler"？
+    A: RF-DETR 训练时需实时编译 C 扩展。当前 Dockerfile 已在运行阶段安装 gcc/g++；旧镜像可临时补装：`docker exec yolov11-gpu apt-get update && apt-get install -y gcc g++`。
+
+    #### Q: RF-DETR 提示未安装 rfdetr？
+    A: 本地运行执行 `pip install -r requirements-rfdetr.txt`；Docker 部署用 `docker compose --profile gpu build --build-arg INSTALL_RFDETR=true` 重建镜像。要求 torch>=2.6（GPU 镜像默认已满足）。
+
+    #### Q: RF-DETR 支持哪些功能？
+    A: 仅支持检测任务的训练与单张图片预测。暂不支持：预约训练、分割/姿态/分类/OBB、批量与视频推理、ONNX/RKNN 导出。这些功能请使用 YOLO 框架。
+
+    #### Q: RF-DETR 推理时出现 FutureWarning？
+    A: 属于 rfdetr 库内部的弃用提示和性能建议（如 `Model is not optimized for inference`），不影响功能与结果，可忽略。
     """)
 
         # 初始化各任务下拉框对应的模型选项 + 导出历史列表 + 训练状态恢复 + 取消预约列表

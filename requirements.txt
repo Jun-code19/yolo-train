@@ -3,7 +3,8 @@ gradio>=6,<7
 # torch==2.0.1+cu121  
 # torchvision==0.15.2
 # torchautocast==2.0.1+cu121
-opencv-python
+# 注意：不要同时安装 opencv-python 与 opencv-python-headless，两者提供同名 cv2 包会互相覆盖。
+# 本项目仅做文件读写与图像处理，统一使用 headless 版本。
 opencv-python-headless
 numpy<2
 scikit-learn
@@ -15,7 +16,8 @@ onnxruntime
 onnxslim
 # onnxruntime-gpu
 # RKNN 转换（ONNX → RKNN，目标平台 rk3588）
-rknn-toolkit2==2.3.2
+# 注意：不能写在本文件里，其依赖会升级 onnx / protobuf 破坏上面的固定版本。
+# 需要时单独执行：pip install rknn-toolkit2==2.3.2 --no-deps
 scipy
 coloredlogs
 flatbuffers

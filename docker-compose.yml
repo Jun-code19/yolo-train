@@ -28,6 +28,7 @@ services:
       - ./runs:/app/runs
       - ./convert.py:/app/convert.py
       - ./pt_to_onnx.py:/app/pt_to_onnx.py
+      - ./rfdetr_support.py:/app/rfdetr_support.py
     shm_size: '8g'
     restart: unless-stopped
 
@@ -51,6 +52,7 @@ services:
       - ./runs:/app/runs
       - ./convert.py:/app/convert.py
       - ./pt_to_onnx.py:/app/pt_to_onnx.py
+      - ./rfdetr_support.py:/app/rfdetr_support.py
     environment:
       - NVIDIA_VISIBLE_DEVICES=all
     shm_size: '8g'

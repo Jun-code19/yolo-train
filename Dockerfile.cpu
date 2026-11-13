@@ -20,21 +20,39 @@ RUN apt-get update && \
 WORKDIR /app
 
 # 优先使用本地预下载的 wheels（cp310 manylinux 版本），回退到在线安装
+ARG TORCH_VERSION=2.2.2
+ARG TORCHVISION_VERSION=0.17.2
+ARG INSTALL_RFDETR=false
+
 COPY wheels/ /tmp/wheels/
-RUN if ls /tmp/wheels/torch-*.whl 1>/dev/null 2>&1; then \
-        pip install --no-deps /tmp/wheels/torch-*.whl /tmp/wheels/torchvision-*.whl && \
+RUN if ls /tmp/wheels/torch-${TORCH_VERSION}+cpu*.whl 1>/dev/null 2>&1 && \
+       ls /tmp/wheels/torchvision-${TORCHVISION_VERSION}+cpu*.whl 1>/dev/null 2>&1; then \
+        echo "检测到匹配的本地 wheel (torch ${TORCH_VERSION}+cpu)，开始离线安装..." && \
+        pip install --no-deps /tmp/wheels/torch-${TORCH_VERSION}+cpu*.whl \
+                            /tmp/wheels/torchvision-${TORCHVISION_VERSION}+cpu*.whl && \
         pip install typing-extensions networkx sympy filelock jinja2 fsspec markupsafe \
             -i https://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com && \
         rm -rf /tmp/wheels; \
     else \
-        pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu; \
+        echo "本地 wheel 与请求版本不匹配，在线安装 torch ${TORCH_VERSION}+cpu..." && \
+        pip install torch==${TORCH_VERSION}+cpu torchvision==${TORCHVISION_VERSION}+cpu \
+            --index-url https://download.pytorch.org/whl/cpu \
+            --extra-index-url https://mirrors.aliyun.com/pypi/simple/ \
+            --trusted-host mirrors.aliyun.com; \
     fi && \
-    pip install "numpy<2" ultralytics gradio opencv-python-headless scikit-learn seaborn "onnx==1.15.0" "protobuf==3.20.3" onnxslim onnxruntime dill \
+    pip install "numpy<2" ultralytics "gradio>=6,<7" opencv-python-headless scikit-learn seaborn "onnx==1.15.0" "protobuf==3.20.3" onnxslim onnxruntime dill \
         -i https://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com && \
     pip install rknn-toolkit2==2.3.2 --no-deps \
         -i https://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com && \
     pip install scipy coloredlogs flatbuffers ruamel.yaml fast-histogram \
         -i https://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com
+
+# 可选：安装 RF-DETR（CPU 下训练极慢，仅建议做推理/链路验证）
+# 开启方式：docker build --build-arg INSTALL_RFDETR=true ...
+RUN if [ "$INSTALL_RFDETR" = "true" ]; then \
+        pip install "rfdetr[train,loggers]>=1.12.0" \
+            -i https://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com; \
+    fi
 
 # ==================== 运行阶段 ====================
 FROM python:3.10-slim-bookworm
@@ -50,10 +68,10 @@ RUN sed -i 's|deb.debian.org|mirrors.aliyun.com|g' /etc/apt/sources.list.d/debia
     sed -i 's|security.debian.org|mirrors.aliyun.com|g' /etc/apt/sources.list.d/debian.sources 2>/dev/null || \
     sed -i 's|security.debian.org|mirrors.aliyun.com|g' /etc/apt/sources.list 2>/dev/null || true
 
-# 仅安装运行时系统依赖（不含 gcc/g++）
+# 安装运行时系统依赖 + gcc/g++（RF-DETR 训练时需实时编译 C 扩展）
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
-    libgl1 libglib2.0-0 libsm6 libxcb1 ffmpeg && \
+    libgl1 libglib2.0-0 libsm6 libxcb1 ffmpeg gcc g++ && \
     rm -rf /var/lib/apt/lists/*
 
 # 从构建阶段复制 Python 包

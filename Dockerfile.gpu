@@ -1,5 +1,5 @@
 # YOLO11 视觉智能平台 - GPU 版 Dockerfile (多阶段构建)
-# 使用 Python 3.10 官方镜像 + torch 2.0.1+cu117（wheel 自带 CUDA 11.7 运行库）
+# 使用 Python 3.10 官方镜像 + torch 2.6.0+cu118
 # NVIDIA Container Toolkit 会通过 --gpus all 自动注入宿主机 GPU 驱动
 FROM python:3.10-slim-bookworm AS builder
 
@@ -21,27 +21,63 @@ RUN apt-get update && \
 
 WORKDIR /app
 
+# torch 版本参数化：默认 2.6.0+cu118。
+# 为什么是 2.6：rfdetr 1.12 依赖 transformers>=5.1，而 transformers 5.x 要求 torch>=2.6，
+# 低于 2.6 时 transformers 会禁用 PyTorch，导致 RF-DETR 导入失败。
+# 注意：cu118 最高只有 torch 2.6.0，2.7 起官方不再提供 cu118 wheel。
+# 需要其他版本时用构建参数切换，例如：
+#   docker build -f Dockerfile.gpu \
+#     --build-arg TORCH_VERSION=2.3.1 --build-arg TORCHVISION_VERSION=0.18.1 \
+#     --build-arg TORCH_CUDA=cu118 .
+ARG TORCH_VERSION=2.6.0
+ARG TORCHVISION_VERSION=0.21.0
+ARG TORCH_CUDA=cu118
+ARG INSTALL_RFDETR=false
+
 # 安装 PyTorch + 项目依赖
-# 优先使用本地 wheel（wheels_gpu/ 目录，需为 cp310 + cu117 版本）
-# torch 2.0.1+cu117 的 wheel 自带完整 CUDA 11.7 运行库，无需在线下载 nvidia-* 依赖
+# 优先使用本地 wheel（wheels_gpu/ 目录，需为 cp310 + 对应 CUDA 版本）
+# 注意：cu118 的 torch wheel 并不自带 CUDA 运行库，仍依赖 nvidia-*-cu11 子包，
+#       因此这里不能加 --no-deps，否则镜像内 torch.cuda 不可用。
 COPY wheels_gpu/ /tmp/wheels_gpu/
-RUN if ls /tmp/wheels_gpu/*.whl 1>/dev/null 2>&1; then \
-        echo "检测到本地 wheel 文件，开始离线安装..." && \
-        pip install --no-deps /tmp/wheels_gpu/*.whl && \
-        pip install typing-extensions networkx sympy filelock jinja2 fsspec markupsafe \
-            -i https://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com && \
+RUN if ls /tmp/wheels_gpu/torch-${TORCH_VERSION}+${TORCH_CUDA}*.whl 1>/dev/null 2>&1 && \
+       ls /tmp/wheels_gpu/torchvision-${TORCHVISION_VERSION}+${TORCH_CUDA}*.whl 1>/dev/null 2>&1; then \
+        echo "检测到匹配的本地 wheel (torch ${TORCH_VERSION}+${TORCH_CUDA})，使用本地 wheel 安装..." && \
+        pip install /tmp/wheels_gpu/torch-${TORCH_VERSION}+${TORCH_CUDA}*.whl \
+                            /tmp/wheels_gpu/torchvision-${TORCHVISION_VERSION}+${TORCH_CUDA}*.whl \
+            --extra-index-url https://mirrors.aliyun.com/pypi/simple/ \
+            --trusted-host mirrors.aliyun.com && \
         rm -rf /tmp/wheels_gpu; \
     else \
-        echo "本地 wheel 不存在，尝试通过 PyTorch 官方源在线安装 cu117 版本..." && \
-        pip install torch==2.0.1+cu117 torchvision==0.15.2+cu117 \
-            --index-url https://download.pytorch.org/whl/cu117; \
+        echo "本地 wheel 与请求版本不匹配，在线安装 torch ${TORCH_VERSION}+${TORCH_CUDA}..." && \
+        pip install torch==${TORCH_VERSION}+${TORCH_CUDA} torchvision==${TORCHVISION_VERSION}+${TORCH_CUDA} \
+            --index-url https://download.pytorch.org/whl/${TORCH_CUDA} \
+            --extra-index-url https://mirrors.aliyun.com/pypi/simple/ \
+            --trusted-host mirrors.aliyun.com; \
     fi && \
-    pip install "numpy<2" ultralytics gradio opencv-python-headless scikit-learn seaborn "onnx==1.15.0" "protobuf==3.20.3" onnxslim onnxruntime dill \
+    pip install "numpy<2" ultralytics "gradio>=6,<7" opencv-python-headless scikit-learn seaborn "onnx==1.15.0" "protobuf==3.20.3" onnxslim onnxruntime dill \
         -i https://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com && \
     pip install rknn-toolkit2==2.3.2 --no-deps \
         -i https://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com && \
     pip install scipy coloredlogs flatbuffers ruamel.yaml fast-histogram \
         -i https://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com
+
+# 可选：安装 RF-DETR。
+# 注意：rfdetr 依赖 transformers>=5.1，而 transformers 5.x 要求 torch>=2.6。
+# 若 torch 已安装但低于 2.6，pip 会在解析 rfdetr 依赖时把 torch 升级到最新版
+# （例如 cu130），导致 CUDA 驱动不兼容、torch.cuda 不可用。
+# 因此这里用 constraints 文件锁定 torch/torchvision 的版本号，
+# 禁止 pip 在安装 rfdetr 时升级它们。
+# 注意：约束里不能带本地版本标签（+cu118），否则 pip 在 aliyun 索引里
+# 找不到 "2.6.0+cu118" 会报 ResolutionImpossible；
+# 不带标签的 "==2.6.0" 按 PEP 440 同样匹配已安装的 2.6.0+cu118。
+RUN if [ "$INSTALL_RFDETR" = "true" ]; then \
+        printf 'torch==%s\ntorchvision==%s\n' \
+            "${TORCH_VERSION}" "${TORCHVISION_VERSION}" > /tmp/constraints.txt && \
+        pip install "rfdetr[train,loggers]>=1.12.0" \
+            -c /tmp/constraints.txt \
+            -i https://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com && \
+        rm -f /tmp/constraints.txt; \
+    fi
 
 # ==================== 运行阶段 ====================
 FROM python:3.10-slim-bookworm
@@ -57,10 +93,10 @@ RUN sed -i 's|deb.debian.org|mirrors.aliyun.com|g' /etc/apt/sources.list.d/debia
     sed -i 's|security.debian.org|mirrors.aliyun.com|g' /etc/apt/sources.list.d/debian.sources 2>/dev/null || \
     sed -i 's|security.debian.org|mirrors.aliyun.com|g' /etc/apt/sources.list 2>/dev/null || true
 
-# 仅安装运行时系统依赖（不含 gcc/g++，镜像更小）
+# 安装运行时系统依赖 + gcc/g++（RF-DETR 训练时需实时编译 C 扩展）
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
-    libgl1 libglib2.0-0 libsm6 libxcb1 ffmpeg && \
+    libgl1 libglib2.0-0 libsm6 libxcb1 ffmpeg gcc g++ && \
     rm -rf /var/lib/apt/lists/*
 
 # 从构建阶段复制 Python 包
